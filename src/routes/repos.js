@@ -2,10 +2,92 @@ import { encrypt } from '../services/crypto.js'
 import { createGithubClient } from '../services/github.js'
 import { manualReIndex } from '../services/indexer.js'
 
+const GITHUB_API = 'https://api.github.com'
+
 function createError(message, code = 'INTERNAL_ERROR', statusCode = 500, details = null) {
   const err = { error: message, code }
   if (details) err.details = details
   return err
+}
+
+// ─── VALIDATION HELPERS (SSRF Defense) ───────────────────────────
+
+/**
+ * Validates a GitHub repository URL and returns the owner/repo slug.
+ * Prevents SSRF by rejecting URLs with unexpected paths, query params,
+ * fragments, or usernames.
+ */
+function parseGitHubRepoUrl(urlString) {
+  if (!urlString || typeof urlString !== 'string') {
+    throw new Error('URL is required')
+  }
+
+  let parsed
+  try {
+    parsed = new URL(urlString)
+  } catch {
+    throw new Error('Invalid URL format')
+  }
+
+  // Must be https://github.com/owner/repo
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com') {
+    throw new Error('URL must be a valid GitHub repository URL (https://github.com/owner/repo)')
+  }
+
+  // Reject URLs with query strings or fragments (could be used for injection)
+  if (parsed.search || parsed.hash) {
+    throw new Error('URL must not contain query parameters or fragments')
+  }
+
+  // Extract owner/repo from pathname
+  const path = parsed.pathname.replace(/^\/+/, '').replace(/\/+$/, '')
+  const parts = path.split('/').filter(Boolean)
+
+  if (parts.length !== 2) {
+    throw new Error('URL path must be in the format /owner/repo')
+  }
+
+  const [owner, repo] = parts
+
+  // GitHub username rules (simplified but strict)
+  if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/.test(owner) || /--/.test(owner)) {
+    throw new Error(`Invalid GitHub owner name: "${owner}"`)
+  }
+
+  // GitHub repo name rules
+  if (!/^[a-zA-Z0-9._-]{1,100}$/.test(repo)) {
+    throw new Error(`Invalid GitHub repository name: "${repo}"`)
+  }
+
+  return { owner, repo, slug: `${owner}/${repo}` }
+}
+
+/**
+ * Safely builds a GitHub API URL for a repo endpoint.
+ * Every path segment is individually encoded.
+ */
+function buildRepoApiUrl(owner, repo, ...pathSegments) {
+  const url = new URL(`${GITHUB_API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`)
+  for (const seg of pathSegments) {
+    if (seg !== '' && seg !== null && seg !== undefined) {
+      url.pathname += '/' + encodeURIComponent(seg)
+    }
+  }
+  return url
+}
+
+/**
+ * Validates a repo slug in owner/repo format.
+ */
+function validateRepoSlug(slug) {
+  if (!slug || typeof slug !== 'string') {
+    throw new Error('Repository slug is required')
+  }
+  const parts = slug.split('/')
+  if (parts.length !== 2) {
+    throw new Error(`repo must be "owner/repo", got "${slug}"`)
+  }
+  return parseGitHubRepoUrl(`https://github.com/${slug}`)
 }
 
 export default async function reposRoutes(fastify) {
@@ -18,8 +100,14 @@ export default async function reposRoutes(fastify) {
       return reply.status(400).send(createError('Missing url or github_pat', 'MISSING_FIELD', 400))
     }
 
-    const repo = url.replace('https://github.com/', '').replace(/\/$/, '')
-    const github = createGithubClient(github_pat, repo)
+    let owner, repo, slug
+    try {
+      ;({ owner, repo, slug } = parseGitHubRepoUrl(url))
+    } catch (err) {
+      return reply.status(400).send(createError(err.message, 'INVALID_URL', 400))
+    }
+
+    const github = createGithubClient(github_pat, slug)
     try {
       const tree = await github.getRepoTree()
       const topDirs = tree
@@ -30,7 +118,7 @@ export default async function reposRoutes(fastify) {
         .map(f => f.path.replace('/package.json', ''))
         .filter(p => p !== '')
       return reply.send({
-        repo,
+        repo: slug,
         top_level_directories: topDirs,
         detected_package_json_roots: pkgPaths.length ? pkgPaths : ['(root)']
       })
@@ -47,17 +135,21 @@ export default async function reposRoutes(fastify) {
     if (!name || !url || !github_pat) {
       return reply.status(400).send(createError('Missing required fields', 'MISSING_FIELD', 400))
     }
-    if (!url.startsWith('https://github.com/')) {
-      return reply.status(400).send(createError('URL must be a valid GitHub repository URL', 'INVALID_URL', 400))
-    }
     if (name.length > 100) {
       return reply.status(400).send(createError('Name must be 100 characters or less', 'VALIDATION_FAILED', 400))
     }
 
-    const repoPath = url.replace('https://github.com/', '').replace(/\/$/, '')
-
+    let owner, repo, slug
     try {
-      const validateRes = await fetch(`https://api.github.com/repos/${repoPath}`, {
+      ;({ owner, repo, slug } = parseGitHubRepoUrl(url))
+    } catch (err) {
+      return reply.status(400).send(createError(err.message, 'INVALID_URL', 400))
+    }
+
+    // Validate we can reach the repo via GitHub API using a safely-built URL
+    try {
+      const validateUrl = buildRepoApiUrl(owner, repo)
+      const validateRes = await fetch(validateUrl, {
         headers: {
           Authorization: `Bearer ${github_pat}`,
           Accept: 'application/vnd.github+json'
@@ -88,10 +180,9 @@ export default async function reposRoutes(fastify) {
 
     if (error) return reply.status(500).send(createError(error.message, 'DB_ERROR'))
 
-    const targetRepo = url.replace('https://github.com/', '').replace(/\/$/, '')
     try {
-      await triggerIndexWorkflow(targetRepo, data.id, github_pat, source_root)
-      console.log(`Indexing triggered for ${targetRepo} (root: ${source_root || 'repo root'})`)
+      await triggerIndexWorkflow(slug, data.id, github_pat, source_root)
+      console.log(`Indexing triggered for ${slug} (root: ${source_root || 'repo root'})`)
     } catch (err) {
       console.error(`Failed to trigger indexing: ${err.message}`)
       return reply.status(500).send({
@@ -168,317 +259,4 @@ export default async function reposRoutes(fastify) {
       return reply.status(500).send(createError(error.message, 'DB_ERROR'))
     }
 
-    const keywords = q.toLowerCase().split(/\W+/).filter(Boolean)
-    const scored = (files || []).map(f => {
-      const pathLower = f.path.toLowerCase()
-      const score = keywords.reduce((sum, kw) => sum + (pathLower.includes(kw) ? 1 : 0), 0)
-      return { path: f.path, language: f.language, score }
-    }).filter(f => f.score > 0)
-
-    scored.sort((a, b) => b.score - a.score)
-    const top = scored.slice(0, 8)
-
-    return reply.send({ files: top })
-  })
-
-  // ─── DEPENDENCY GRAPH ────────────────────────────────────────────
-  fastify.get('/repos/:id/graph', async (req, reply) => {
-    const owner_id = req.user.id
-    const repoId = parseInt(req.params.id, 10)
-
-    if (!repoId) {
-      return reply.status(400).send(createError('Invalid repo ID', 'VALIDATION_FAILED', 400))
-    }
-
-    const { data: repo } = await supabase
-      .from('repos')
-      .select('id')
-      .eq('id', repoId)
-      .eq('owner_id', owner_id)
-      .single()
-
-    if (!repo) {
-      return reply.status(403).send(createError('Repo not found or unauthorized', 'FORBIDDEN', 403))
-    }
-
-    const { data: files, error: filesError } = await supabase
-      .from('files')
-      .select('id, path, language')
-      .eq('repo_id', repoId)
-      .limit(500)
-
-    if (filesError) {
-      return reply.status(500).send(createError(filesError.message, 'DB_ERROR'))
-    }
-
-    if (!files || files.length === 0) {
-      return reply.send({ files: [], symbols: [], edges: [] })
-    }
-
-    const fileIds = files.map(f => f.id)
-
-    const [symbolsResult, edgesResult] = await Promise.all([
-      supabase
-        .from('symbols')
-        .select('id, file_id, name, kind, exported')
-        .in('file_id', fileIds)
-        .limit(2000),
-      supabase
-        .from('edges')
-        .select('from_symbol_id, to_symbol_id, edge_type, source_file_id')
-        .in('source_file_id', fileIds)
-        .limit(2000)
-    ])
-
-    if (symbolsResult.error) {
-      return reply.status(500).send(createError(symbolsResult.error.message, 'DB_ERROR'))
-    }
-
-    if (edgesResult.error) {
-      return reply.status(500).send(createError(edgesResult.error.message, 'DB_ERROR'))
-    }
-
-    return reply.send({
-      files,
-      symbols: symbolsResult.data || [],
-      edges: edgesResult.data || []
-    })
-  })
-
-
-  // --- SUBGRAPH FOR PLAN REVIEW -------------------------------------------
-  // GET /repos/:id/subgraph?paths[]=src/foo.tsx&paths[]=src/bar.tsx
-  //
-  // Returns the real file-level dependency subgraph for a set of file paths.
-  // Used by PlanReview to show an accurate impact map instead of a fake
-  // circular layout.
-  //
-  // Response: { nodes: [{ id, path, role }], edges: [{ from, to, type }] }
-  fastify.get('/repos/:id/subgraph', async (req, reply) => {
-    const owner_id = req.user.id
-    const repoId   = parseInt(req.params.id, 10)
-
-    if (!repoId) {
-      return reply.status(400).send(createError('Invalid repo ID', 'VALIDATION_FAILED', 400))
-    }
-
-    // Ownership check
-    const { data: repo } = await supabase
-      .from('repos')
-      .select('id')
-      .eq('id', repoId)
-      .eq('owner_id', owner_id)
-      .single()
-
-    if (!repo) {
-      return reply.status(403).send(createError('Repo not found or unauthorized', 'FORBIDDEN', 403))
-    }
-
-    // Parse paths[] query param (array or single string)
-    let rawPaths = req.query['paths[]'] || req.query.paths || []
-    if (typeof rawPaths === 'string') rawPaths = [rawPaths]
-    const inputPaths = rawPaths.slice(0, 20).filter(Boolean)
-
-    if (inputPaths.length === 0) {
-      return reply.send({ nodes: [], edges: [] })
-    }
-
-    // Step 1: resolve input paths -> file rows
-    const { data: inputFiles, error: fileErr } = await supabase
-      .from('files')
-      .select('id, path')
-      .eq('repo_id', repoId)
-      .in('path', inputPaths)
-
-    if (fileErr) {
-      return reply.status(500).send(createError(fileErr.message, 'DB_ERROR'))
-    }
-
-    if (!inputFiles || inputFiles.length === 0) {
-      return reply.send({ nodes: [], edges: [] })
-    }
-
-    const inputFileIds = inputFiles.map(f => f.id)
-
-    // Step 2: fetch IMPORTS edges where source is one of our files OR
-    //         the target symbol belongs to one of our files (1-hop reverse)
-    //
-    // We do two separate queries and merge because Supabase does not support
-    // OR across different columns in a single .in() chain efficiently.
-    const [fwdResult, revResult] = await Promise.all([
-      // Forward: files that our input files import
-      supabase
-        .from('edges')
-        .select('source_file_id, to:to_symbol_id(file_id), edge_type')
-        .eq('edge_type', 'IMPORTS')
-        .in('source_file_id', inputFileIds)
-        .limit(200),
-
-      // Reverse: files that import our input files
-      // We join through to_symbol -> symbols -> file_id
-      supabase
-        .from('edges')
-        .select('source_file_id, to:to_symbol_id(file_id), edge_type')
-        .eq('edge_type', 'IMPORTS')
-        .in('to.file_id', inputFileIds)
-        .limit(200),
-    ])
-
-    if (fwdResult.error) {
-      return reply.status(500).send(createError(fwdResult.error.message, 'DB_ERROR'))
-    }
-
-    // Collect all file IDs mentioned in edges
-    const allFileIds = new Set(inputFileIds)
-    const rawEdges   = [...(fwdResult.data || []), ...(revResult.data || [])]
-
-    const edgeList = []
-    for (const e of rawEdges) {
-      const fromId = e.source_file_id
-      const toId   = e.to?.file_id
-      if (!fromId || !toId || fromId === toId) continue
-      allFileIds.add(fromId)
-      allFileIds.add(toId)
-      edgeList.push({ from: fromId, to: toId, type: e.edge_type })
-    }
-
-    // Deduplicate edges
-    const seenEdges = new Set()
-    const dedupedEdges = edgeList.filter(e => {
-      const key = `${e.from}|${e.to}`
-      if (seenEdges.has(key)) return false
-      seenEdges.add(key)
-      return true
-    })
-
-    // Cap total file IDs to avoid large fetches (input files always included)
-    const cappedIds = [
-      ...inputFileIds,
-      ...[...allFileIds].filter(id => !inputFileIds.includes(id)).slice(0, 30)
-    ]
-
-    // Step 3: fetch file metadata for all nodes
-    const { data: nodeFiles, error: nodeErr } = await supabase
-      .from('files')
-      .select('id, path, language')
-      .in('id', cappedIds)
-
-    if (nodeErr) {
-      return reply.status(500).send(createError(nodeErr.message, 'DB_ERROR'))
-    }
-
-    // Step 4: fetch file roles from __file__ symbols
-    const { data: roleSymbols } = await supabase
-      .from('symbols')
-      .select('file_id, metadata')
-      .eq('name', '__file__')
-      .in('file_id', cappedIds)
-
-    const roleMap = new Map()
-    for (const s of roleSymbols || []) {
-      roleMap.set(s.file_id, s.metadata?.fileRole || 'none')
-    }
-
-    const nodes = (nodeFiles || []).map(f => ({
-      id:   f.id,
-      path: f.path,
-      role: roleMap.get(f.id) || 'none',
-    }))
-
-    // Filter edges to only include those between known node IDs
-    const nodeIdSet = new Set(nodes.map(n => n.id))
-    const filteredEdges = dedupedEdges.filter(
-      e => nodeIdSet.has(e.from) && nodeIdSet.has(e.to)
-    )
-
-    return reply.send({ nodes, edges: filteredEdges })
-  })
-
-  // ─── SYMBOL DETAIL ───────────────────────────────────────────────
-  fastify.get('/repos/:id/graph/symbol/:symbolId', async (req, reply) => {
-    const owner_id = req.user.id
-    const repoId = parseInt(req.params.id, 10)
-    const symbolId = parseInt(req.params.symbolId, 10)
-
-    if (!repoId) {
-      return reply.status(400).send(createError('Invalid repo ID', 'VALIDATION_FAILED', 400))
-    }
-
-    const { data: repo } = await supabase
-      .from('repos')
-      .select('id')
-      .eq('id', repoId)
-      .eq('owner_id', owner_id)
-      .single()
-
-    if (!repo) {
-      return reply.status(403).send(createError('Repo not found or unauthorized', 'FORBIDDEN', 403))
-    }
-
-    const { data, error } = await supabase
-      .from('symbols')
-      .select('*, files(path, repo_id)')
-      .eq('id', symbolId)
-      .single()
-
-    if (error || !data) {
-      return reply.status(404).send(createError('Symbol not found', 'NOT_FOUND', 404))
-    }
-
-    if (data.files?.repo_id !== repoId) {
-      return reply.status(404).send(createError('Symbol not found in this repo', 'NOT_FOUND', 404))
-    }
-
-    return reply.send({ symbol: data })
-  })
-
-  // ─── MANUAL RE-INDEX ───────────────────────────────────────────
-  fastify.post('/repos/:id/reindex', async (req, reply) => {
-    const owner_id = req.user.id
-    const repoId = parseInt(req.params.id, 10)
-    if (!repoId) {
-      return reply.status(400).send(createError('Invalid repo ID', 'VALIDATION_FAILED', 400))
-    }
-
-    try {
-      const result = await manualReIndex(supabase, repoId, owner_id)
-      return reply.send({ ok: true, sha: result.sha, message: 'Re-index triggered' })
-    } catch (err) {
-      console.error('Manual re-index failed:', err.message)
-      return reply.status(500).send(createError(err.message, 'REINDEX_FAILED'))
-    }
-  })
-
-}
-
-async function triggerIndexWorkflow(targetRepo, repoId, userPat, sourceRoot) {
-  const indexerRepo = process.env.INDEXER_REPO
-  const indexerPat = process.env.INDEXER_PAT
-  if (!indexerRepo || !indexerPat) {
-    throw new Error('INDEXER_REPO or INDEXER_PAT not set')
-  }
-  const res = await fetch(
-    `https://api.github.com/repos/${indexerRepo}/actions/workflows/on-demand-index.yml/dispatches`,
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${indexerPat}`,
-        'Accept': 'application/vnd.github+json',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        ref: 'main',
-        inputs: {
-          target_repo: targetRepo,
-          repo_id: String(repoId),
-          pat_token: userPat,
-          source_root: sourceRoot || ''
-        }
-      })
-    }
-  )
-  if (!res.ok) {
-    const err = await res.text()
-    throw new Error(`Workflow dispatch failed: ${err}`)
-  }
-}
+    const keywords = q.toLowerCase().split(/\
