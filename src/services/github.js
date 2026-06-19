@@ -4,11 +4,100 @@
 
 const GITHUB_API = 'https://api.github.com'
 
-export function createGithubClient(pat, repo) {
-  if (!pat || typeof pat !== 'string') throw new Error('createGithubClient: pat is required')
-  if (!repo || !repo.includes('/')) {
-    throw new Error(`createGithubClient: repo must be "owner/name", got "${repo}"`)
+// ─── VALIDATION HELPERS ────────────────────────────────────────
+
+/**
+ * Checks that a value is a non-empty string.
+ */
+function requireString(value, name) {
+  if (!value || typeof value !== 'string') {
+    throw new Error(`${name} is required and must be a non-empty string`)
   }
+  return value
+}
+
+/**
+ * Validates a GitHub repo identifier (owner/repo).
+ * Only allows letters, numbers, hyphens, underscores, and dots.
+ */
+function validateRepo(repo) {
+  requireString(repo, 'repo')
+
+  const parts = repo.split('/')
+  if (parts.length !== 2) {
+    throw new Error(`repo must be "owner/repo", got "${repo}"`)
+  }
+
+  const [owner, name] = parts
+
+  // GitHub usernames: 1-39 chars, alphanumeric and hyphens only
+  // (no underscores, no dots, no leading/trailing hyphens, no consecutive hyphens)
+  if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/.test(owner)) {
+    throw new Error(`Invalid GitHub owner: "${owner}"`)
+  }
+  if (/--/.test(owner)) {
+    throw new Error(`Invalid GitHub owner: consecutive hyphens in "${owner}"`)
+  }
+
+  // GitHub repo names: 1-100 chars, alphanumeric + . - _
+  if (!/^[a-zA-Z0-9._-]{1,100}$/.test(name)) {
+    throw new Error(`Invalid GitHub repo name: "${name}"`)
+  }
+
+  return { owner, name }
+}
+
+/**
+ * Validates a branch name to prevent URL injection.
+ */
+function validateBranch(name) {
+  requireString(name, 'branch name')
+  if (name.length > 255) {
+    throw new Error('branch name exceeds 255 characters')
+  }
+  // Disallow control chars, backslash, and path traversal
+  if (/[\x00-\x1f\x7f\\]/.test(name) || name.includes('..')) {
+    throw new Error(`Invalid branch name: "${name}"`)
+  }
+  return name
+}
+
+/**
+ * Validates a file path to prevent directory traversal.
+ */
+function validatePath(path) {
+  if (path === null || path === undefined) return ''
+  requireString(path, 'path')
+  // Remove leading slashes
+  const clean = path.replace(/^\/+/, '')
+  // Block path traversal
+  if (clean.includes('..') || clean.includes('\x00')) {
+    throw new Error(`Invalid file path: "${path}"`)
+  }
+  return clean
+}
+
+/**
+ * Safely builds a GitHub API URL by encoding every path segment.
+ */
+function buildUrl(basePath, ...segments) {
+  const url = new URL(GITHUB_API)
+  let path = basePath
+  for (const seg of segments) {
+    if (seg !== '' && seg !== null && seg !== undefined) {
+      path += '/' + encodeURIComponent(seg)
+    }
+  }
+  url.pathname = path
+  return url
+}
+
+export function createGithubClient(pat, repo) {
+  requireString(pat, 'pat')
+
+  // Validate repo and build the safe base URL
+  const { owner, name } = validateRepo(repo)
+  const basePath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`
 
   const headers = {
     Authorization: `Bearer ${pat}`,
@@ -17,11 +106,20 @@ export function createGithubClient(pat, repo) {
     'X-GitHub-Api-Version': '2022-11-28'
   }
 
-  const base = `${GITHUB_API}/repos/${repo}`
-
   // ─── INTERNAL FETCH WITH RATE LIMIT TRACKING ─────────────────
   async function ghFetch(url, options = {}) {
-    const res = await fetch(url, { ...options, headers: { ...headers, ...(options.headers || {}) } })
+    const urlObj = url instanceof URL ? url : new URL(url)
+
+    // SECURITY: Only allow requests to the official GitHub API
+    const allowed = new URL(GITHUB_API)
+    if (urlObj.origin !== allowed.origin) {
+      throw new Error(`Blocked request to unauthorized origin: ${urlObj.origin}`)
+    }
+
+    const res = await fetch(urlObj, {
+      ...options,
+      headers: { ...headers, ...(options.headers || {}) }
+    })
 
     const remaining = res.headers.get('X-RateLimit-Remaining')
     const resetAt = res.headers.get('X-RateLimit-Reset')
@@ -45,7 +143,7 @@ export function createGithubClient(pat, repo) {
   let _defaultBranch = null
   async function getDefaultBranch() {
     if (_defaultBranch) return _defaultBranch
-    const res = await ghFetch(base)
+    const res = await ghFetch(buildUrl(basePath))
     handleStatus(res, 'getDefaultBranch')
     const data = await res.json()
     _defaultBranch = data.default_branch
@@ -55,8 +153,10 @@ export function createGithubClient(pat, repo) {
 
   // ─── REPO FILE TREE ────────────────────────────────────────────
   async function getRepoTree() {
-    const branch = await getDefaultBranch()
-    const res = await ghFetch(`${base}/git/trees/${branch}?recursive=1`)
+    const branch = validateBranch(await getDefaultBranch())
+    const url = buildUrl(basePath, 'git', 'trees', branch)
+    url.searchParams.set('recursive', '1')
+    const res = await ghFetch(url)
     handleStatus(res, 'getRepoTree')
     const data = await res.json()
     if (data.truncated) {
@@ -70,9 +170,11 @@ export function createGithubClient(pat, repo) {
 
   // ─── FILE CONTENT ──────────────────────────────────────────────
   async function getFileContent(path, branchName = null) {
-    const cleanPath = (path || '').replace(/^\/+/, '')
-    let url = `${base}/contents/${cleanPath}`
-    if (branchName) url += `?ref=${branchName}`
+    const cleanPath = validatePath(path)
+    const url = buildUrl(basePath, 'contents', ...cleanPath.split('/').filter(Boolean))
+    if (branchName) {
+      url.searchParams.set('ref', validateBranch(branchName))
+    }
     const res = await ghFetch(url)
     if (res.status === 404) return null
     handleStatus(res, `getFileContent(${cleanPath})`)
@@ -84,9 +186,11 @@ export function createGithubClient(pat, repo) {
 
   // ─── FILE SHA ──────────────────────────────────────────────────
   async function getFileSha(path, branchName = null) {
-    const cleanPath = (path || '').replace(/^\/+/, '')
-    let url = `${base}/contents/${cleanPath}`
-    if (branchName) url += `?ref=${branchName}`
+    const cleanPath = validatePath(path)
+    const url = buildUrl(basePath, 'contents', ...cleanPath.split('/').filter(Boolean))
+    if (branchName) {
+      url.searchParams.set('ref', validateBranch(branchName))
+    }
     const res = await ghFetch(url)
     if (res.status === 404) return null
     handleStatus(res, `getFileSha(${cleanPath})`)
@@ -96,7 +200,8 @@ export function createGithubClient(pat, repo) {
 
   // ─── PUSH FILE ─────────────────────────────────────────────────
   async function pushFile(path, content, message, branch) {
-    const cleanPath = (path || '').replace(/^\/+/, '')
+    const cleanPath = validatePath(path)
+    validateBranch(branch)
     const sha = await getFileSha(cleanPath, branch)
 
     const body = {
@@ -106,7 +211,8 @@ export function createGithubClient(pat, repo) {
       ...(sha ? { sha } : {})
     }
 
-    const res = await ghFetch(`${base}/contents/${cleanPath}`, {
+    const url = buildUrl(basePath, 'contents', ...cleanPath.split('/').filter(Boolean))
+    const res = await ghFetch(url, {
       method: 'PUT',
       body: JSON.stringify(body)
     })
@@ -123,14 +229,18 @@ export function createGithubClient(pat, repo) {
 
   // ─── CREATE BRANCH ─────────────────────────────────────────────
   async function createBranch(branchName) {
-    const defaultBranch = await getDefaultBranch()
-    const refRes = await ghFetch(`${base}/git/ref/heads/${defaultBranch}`)
+    validateBranch(branchName)
+    const defaultBranch = validateBranch(await getDefaultBranch())
+
+    const refUrl = buildUrl(basePath, 'git', 'ref', 'heads', defaultBranch)
+    const refRes = await ghFetch(refUrl)
     handleStatus(refRes, `getRef(${defaultBranch})`)
     const refData = await refRes.json()
     const sha = refData.object?.sha
     if (!sha) throw new Error('GitHub ref response missing SHA')
 
-    const res = await ghFetch(`${base}/git/refs`, {
+    const createUrl = buildUrl(basePath, 'git', 'refs')
+    const res = await ghFetch(createUrl, {
       method: 'POST',
       body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha })
     })
@@ -142,6 +252,7 @@ export function createGithubClient(pat, repo) {
 
   // ─── ENSURE BRANCH AND PUSH (atomic helper) ──────────────────
   async function ensureBranchAndPush(branchName, filePath, content, message) {
+    validateBranch(branchName)
     try {
       await createBranch(branchName)
     } catch (err) {
