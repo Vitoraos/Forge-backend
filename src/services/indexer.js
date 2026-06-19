@@ -7,6 +7,62 @@ import { decrypt } from './crypto.js'
 
 const GITHUB_API = 'https://api.github.com'
 
+// --- Validation Helpers ---
+
+/**
+ * Validates that a string is a legitimate GitHub repository URL
+ */
+function validateGitHubUrl(urlString) {
+  if (!urlString || typeof urlString !== 'string') {
+    throw new Error('Invalid repository URL')
+  }
+  // Must be https://github.com/owner/repo[.git][/]
+  const githubUrlRegex = /^https:\/\/github\.com\/[a-zA-Z0-9-]+\/[a-zA-Z0-9._-]+(?:\.git)?\/?$/
+  if (!githubUrlRegex.test(urlString)) {
+    throw new Error('Repository URL must be a valid GitHub URL (https://github.com/owner/repo)')
+  }
+}
+
+/**
+ * Validates and decomposes a repo slug into encoded owner/repo segments
+ * @returns {{ owner: string, repo: string, encodedUrl: string }}
+ */
+function parseRepoSlug(repoIdentifier, branch) {
+  if (!repoIdentifier || typeof repoIdentifier !== 'string') {
+    throw new Error('Invalid repository identifier')
+  }
+
+  // Remove .git suffix if present
+  const clean = repoIdentifier.replace(/\.git$/, '')
+
+  // Must be exactly owner/repo with allowed GitHub characters
+  const slugRegex = /^[a-zA-Z0-9-]{1,39}\/[a-zA-Z0-9._-]{1,100}$/
+  if (!slugRegex.test(clean)) {
+    throw new Error(`Invalid repository slug: ${repoIdentifier}. Expected format: owner/repo`)
+  }
+
+  const [owner, repo] = clean.split('/')
+
+  // GitHub usernames cannot start/end with hyphen or contain consecutive hyphens
+  if (/--/.test(owner) || /^-|-$/.test(owner)) {
+    throw new Error(`Invalid GitHub owner name: ${owner}`)
+  }
+
+  // Validate branch name
+  if (!branch || typeof branch !== 'string' || branch.length > 255 || /[\x00-\x1f\x7f]/.test(branch)) {
+    throw new Error('Invalid branch name')
+  }
+
+  // Build URL safely with encoded path segments
+  const url = new URL(
+    `${GITHUB_API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeURIComponent(branch)}`
+  )
+
+  return { owner, repo, encodedUrl: url.toString() }
+}
+
+// --- Core Functions ---
+
 /**
  * Check all repos for changes and trigger re-index if SHA changed
  * @param {object} supabase - Supabase client
@@ -15,7 +71,7 @@ export async function checkAllReposForChanges(supabase) {
   const { data: repos, error } = await supabase
     .from('repos')
     .select('id, name, url, github_pat, default_branch, last_indexed_sha, index_status, source_root')
-    .eq('index_status', 'indexed') // Only check repos that were successfully indexed
+    .eq('index_status', 'indexed')
 
   if (error) {
     console.error('Failed to load repos for change detection:', error.message)
@@ -59,14 +115,16 @@ export async function checkRepoForChanges(supabase, repo) {
   // Decrypt PAT
   const pat = decrypt(repo.github_pat)
 
-  // Derive owner/repo from URL
+  // Derive owner/repo from URL with strict validation
   let repoSlug = repo.name
   try {
+    validateGitHubUrl(repo.url)
     const url = new URL(repo.url)
     const path = url.pathname.replace(/^\/+/, '').replace(/\.git$/, '')
     if (path.includes('/')) repoSlug = path
-  } catch {
-    // Use raw name
+  } catch (err) {
+    console.warn(`Invalid GitHub URL for repo ${repo.id}: ${repo.url}. Falling back to repo name.`)
+    // Continue with repo.name — it will be validated in getBranchSha
   }
 
   const github = createGithubClient(pat, repoSlug)
@@ -81,7 +139,6 @@ export async function checkRepoForChanges(supabase, repo) {
 
   // Compare with stored SHA
   if (latestSha === repo.last_indexed_sha) {
-    // No changes
     return false
   }
 
@@ -96,7 +153,10 @@ export async function checkRepoForChanges(supabase, repo) {
  * Get the latest commit SHA for a branch via GitHub API
  */
 async function getBranchSha(pat, repo, branch) {
-  const res = await fetch(`${GITHUB_API}/repos/${repo}/git/ref/heads/${branch}`, {
+  // Validate inputs and build safe URL
+  const { encodedUrl } = parseRepoSlug(repo, branch)
+
+  const res = await fetch(encodedUrl, {
     headers: {
       Authorization: `Bearer ${pat}`,
       Accept: 'application/vnd.github+json'
@@ -119,22 +179,19 @@ async function getBranchSha(pat, repo, branch) {
  * Trigger re-indexing workflow and update stored SHA
  */
 async function triggerReIndex(supabase, repo, pat, newSha) {
-  // Update status to indicate re-indexing is in progress
   await supabase
     .from('repos')
     .update({
       index_status: 'indexing',
-      last_indexed_sha: newSha // Update immediately to prevent duplicate triggers
+      last_indexed_sha: newSha
     })
     .eq('id', repo.id)
 
-  // Trigger the GitHub Actions workflow
   try {
     await triggerIndexWorkflow(repo, pat)
     console.log(`🚀 Re-index triggered for repo ${repo.id}`)
   } catch (err) {
     console.error(`Failed to trigger re-index for repo ${repo.id}:`, err.message)
-    // Revert status so it will be checked again
     await supabase
       .from('repos')
       .update({ index_status: 'indexed' })
@@ -153,6 +210,8 @@ async function triggerIndexWorkflow(repo, userPat) {
     throw new Error('INDEXER_REPO or INDEXER_PAT not set')
   }
 
+  // Validate that the repo URL is actually a GitHub URL before extracting target
+  validateGitHubUrl(repo.url)
   const targetRepo = repo.url.replace('https://github.com/', '').replace(/\/$/, '')
 
   const res = await fetch(
@@ -183,10 +242,7 @@ async function triggerIndexWorkflow(repo, userPat) {
 }
 
 /**
- * Mark a repo as successfully indexed (called by indexer.js after completion)
- * @param {object} supabase - Supabase client
- * @param {number} repoId - Repo ID
- * @param {string} sha - The SHA that was indexed
+ * Mark a repo as successfully indexed
  */
 export async function markRepoIndexed(supabase, repoId, sha) {
   const { error } = await supabase
@@ -207,9 +263,6 @@ export async function markRepoIndexed(supabase, repoId, sha) {
 
 /**
  * Manual re-index trigger for a specific repo
- * @param {object} supabase - Supabase client
- * @param {number} repoId - Repo ID
- * @param {string} userId - Owner ID (for verification)
  */
 export async function manualReIndex(supabase, repoId, userId) {
   const { data: repo, error } = await supabase
@@ -225,6 +278,11 @@ export async function manualReIndex(supabase, repoId, userId) {
 
   const pat = decrypt(repo.github_pat)
   const branch = repo.default_branch || 'main'
+
+  // Validate the repo identifier before use
+  const { encodedUrl } = parseRepoSlug(repo.name, branch)
+
+  // We don't need the URL here, but parseRepoSlug validates the format
   const latestSha = await getBranchSha(pat, repo.name, branch)
 
   if (!latestSha) {
